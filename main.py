@@ -2,6 +2,7 @@ import os
 import re
 import time
 import html
+import json
 import random
 import sqlite3
 import hashlib
@@ -36,9 +37,14 @@ SEND_DELAY_MAX = int(os.getenv("SEND_DELAY_MAX", "90"))
 FIRST_RUN_SKIP_OLD = os.getenv("FIRST_RUN_SKIP_OLD", "true").lower() == "true"
 
 SEND_IMAGES = os.getenv("SEND_IMAGES", "true").lower() == "true"
-MAX_IMAGES_PER_POST = int(os.getenv("MAX_IMAGES_PER_POST", "3"))
+MAX_IMAGES_PER_POST = int(os.getenv("MAX_IMAGES_PER_POST", "10"))
 
+# 遇到视频消息是否跳过
+SKIP_VIDEO_POSTS = os.getenv("SKIP_VIDEO_POSTS", "true").lower() == "true"
+
+# 联系方式替换
 ENABLE_CONTACT_REPLACE = os.getenv("ENABLE_CONTACT_REPLACE", "true").lower() == "true"
+CONTACT_HANDLE = os.getenv("CONTACT_HANDLE", "").strip()
 CONTACT_TEXT = os.getenv("CONTACT_TEXT", "投稿/商务合作：@你的TG号").replace("\\n", "\n").strip()
 
 REQUIRE_NEWS_KEYWORDS = os.getenv("REQUIRE_NEWS_KEYWORDS", "true").lower() == "true"
@@ -88,6 +94,7 @@ def split_keywords(value: str, default: List[str]) -> List[str]:
     value = value.strip()
     if not value:
         return default
+
     parts = re.split(r"[,，\n|]+", value)
     return [x.strip() for x in parts if x.strip()]
 
@@ -98,10 +105,12 @@ NEWS_KEYWORDS = split_keywords(os.getenv("NEWS_KEYWORDS", ""), DEFAULT_NEWS_KEYW
 
 def parse_admin_ids(raw: str) -> set:
     ids = set()
+
     for item in re.split(r"[,，\s]+", raw):
         item = item.strip()
         if item.isdigit():
             ids.add(int(item))
+
     return ids
 
 
@@ -127,6 +136,7 @@ logger = logging.getLogger("tg-web-scraper")
 class DB:
     def __init__(self, path: str):
         self.path = path
+
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -181,6 +191,7 @@ class DB:
             status,
             int(time.time())
         ))
+
         self.conn.commit()
 
     def get_setting(self, key: str) -> Optional[str]:
@@ -196,6 +207,7 @@ class DB:
         VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
         """, (key, value))
+
         self.conn.commit()
 
     def is_source_initialized(self, source_name: str) -> bool:
@@ -214,6 +226,7 @@ db = DB(DB_PATH)
 
 def normalize_source_page(src: str) -> str:
     src = src.strip()
+
     if not src:
         return ""
 
@@ -260,6 +273,7 @@ def make_source_pages() -> List[str]:
         return []
 
     pages = []
+
     for item in re.split(r"[,，\n]+", SOURCE_PAGES_RAW):
         url = normalize_source_page(item)
         if url:
@@ -271,11 +285,14 @@ def make_source_pages() -> List[str]:
 def keyword_count(text: str, keywords: List[str]) -> int:
     if not text:
         return 0
+
     lower = text.lower()
     count = 0
+
     for kw in keywords:
         if kw and kw.lower() in lower:
             count += 1
+
     return count
 
 
@@ -317,6 +334,7 @@ def extract_background_image(style: str) -> Optional[str]:
         return None
 
     match = re.search(r"background-image\s*:\s*url\(['\"]?(.*?)['\"]?\)", style)
+
     if match:
         return html.unescape(match.group(1)).strip()
 
@@ -335,6 +353,7 @@ def fetch_page(url: str) -> str:
 
     resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
+
     return resp.text
 
 
@@ -361,9 +380,11 @@ def parse_messages(source_url: str, page_html: str) -> List[Dict]:
 
         images = []
 
+        # 普通图片
         for photo in msg.select(".tgme_widget_message_photo_wrap"):
             style = photo.get("style", "")
             img_url = extract_background_image(style)
+
             if img_url:
                 images.append(img_url)
 
@@ -373,7 +394,36 @@ def parse_messages(source_url: str, page_html: str) -> List[Dict]:
                 if src:
                     images.append(html.unescape(src).strip())
 
+        # 有些图在 link preview 或其他图片标签里
+        for img_tag in msg.select("img"):
+            src = img_tag.get("src") or img_tag.get("data-src")
+            if src and "emoji" not in src and "tgme" not in src:
+                images.append(html.unescape(src).strip())
+
         images = list(dict.fromkeys([x for x in images if x]))
+
+        # 检测视频消息
+        has_video = False
+
+        video_selectors = [
+            ".tgme_widget_message_video_player",
+            ".tgme_widget_message_video_thumb",
+            ".tgme_widget_message_video",
+            ".tgme_widget_message_video_wrap",
+            ".tgme_widget_message_video_duration",
+            "video",
+        ]
+
+        for selector in video_selectors:
+            if msg.select_one(selector):
+                has_video = True
+                break
+
+        class_text = " ".join(msg.get("class", []))
+        inner_html = str(msg).lower()
+
+        if "video" in class_text.lower() or "tgme_widget_message_video" in inner_html:
+            has_video = True
 
         post_key = f"{data_source}:{message_id}"
         link = f"https://t.me/{data_source}/{message_id}"
@@ -385,6 +435,7 @@ def parse_messages(source_url: str, page_html: str) -> List[Dict]:
             "message_id": message_id,
             "text": text,
             "images": images,
+            "has_video": has_video,
             "link": link,
         })
 
@@ -393,11 +444,15 @@ def parse_messages(source_url: str, page_html: str) -> List[Dict]:
 
 
 # =========================
-# 联系方式清理 / 替换
+# 联系方式替换
 # =========================
 
+TG_HANDLE_RE = re.compile(r"(?<![\w.])@[A-Za-z0-9_]{4,32}\b")
+TG_URL_RE = re.compile(r"https?://t\.me/[A-Za-z0-9_]{4,32}", re.IGNORECASE)
+TG_SHORT_URL_RE = re.compile(r"(?<!https://)(?<!http://)t\.me/[A-Za-z0-9_]{4,32}", re.IGNORECASE)
+
 CONTACT_HANDLE_RE = re.compile(
-    r"(@[A-Za-z0-9_]{4,}|https?://t\.me/[A-Za-z0-9_/?=+\-]+|t\.me/[A-Za-z0-9_/?=+\-]+)",
+    r"(@[A-Za-z0-9_]{4,32}|https?://t\.me/[A-Za-z0-9_]{4,32}|t\.me/[A-Za-z0-9_]{4,32})",
     re.IGNORECASE
 )
 
@@ -407,27 +462,71 @@ CONTACT_KEYWORD_RE = re.compile(
 )
 
 
+def normalize_contact_handle() -> str:
+    handle = CONTACT_HANDLE.strip()
+
+    if not handle:
+        return ""
+
+    if handle.startswith("https://t.me/"):
+        username = handle.replace("https://t.me/", "").strip("/")
+        return f"@{username}"
+
+    if handle.startswith("http://t.me/"):
+        username = handle.replace("http://t.me/", "").strip("/")
+        return f"@{username}"
+
+    if handle.startswith("t.me/"):
+        username = handle.replace("t.me/", "").strip("/")
+        return f"@{username}"
+
+    if not handle.startswith("@"):
+        handle = f"@{handle}"
+
+    return handle
+
+
+def replace_all_contacts(text: str) -> str:
+    if not text:
+        return ""
+
+    if not ENABLE_CONTACT_REPLACE:
+        return text
+
+    handle = normalize_contact_handle()
+
+    if not handle:
+        return text
+
+    username = handle.lstrip("@")
+
+    text = TG_URL_RE.sub(f"https://t.me/{username}", text)
+    text = TG_SHORT_URL_RE.sub(f"t.me/{username}", text)
+    text = TG_HANDLE_RE.sub(handle, text)
+
+    return text
+
+
 def is_contact_line(line: str) -> bool:
     s = line.strip()
+
     if not s:
         return False
 
     if CONTACT_KEYWORD_RE.search(s) and CONTACT_HANDLE_RE.search(s):
         return True
 
-    if CONTACT_KEYWORD_RE.search(s) and re.search(r"(微信|VX|QQ|电话|手机|客服)", s, re.IGNORECASE):
-        return True
-
-    if re.fullmatch(r"(@[A-Za-z0-9_]{4,}|https?://t\.me/[A-Za-z0-9_/?=+\-]+|t\.me/[A-Za-z0-9_/?=+\-]+)", s, re.IGNORECASE):
-        return True
-
-    if re.search(r"(投稿联系|爆料联系|广告合作|商务合作|联系方式|联系飞机|联系客服)", s, re.IGNORECASE):
+    if re.fullmatch(r"(@[A-Za-z0-9_]{4,32}|https?://t\.me/[A-Za-z0-9_]{4,32}|t\.me/[A-Za-z0-9_]{4,32})", s, re.IGNORECASE):
         return True
 
     return False
 
 
 def remove_original_contacts(text: str) -> str:
+    """
+    不再大面积删正文，只清理明显的纯联系方式行。
+    正文里的 @用户名 / t.me 会在 build_final_text 里全局替换成你的。
+    """
     if not text:
         return ""
 
@@ -439,21 +538,19 @@ def remove_original_contacts(text: str) -> str:
             continue
         kept.append(line)
 
-    cleaned = "\n".join(kept)
-
-    cleaned = re.sub(r"(?i)商务合作[:：]?\s*@?[A-Za-z0-9_]{4,}", "", cleaned)
-    cleaned = re.sub(r"(?i)广告合作[:：]?\s*@?[A-Za-z0-9_]{4,}", "", cleaned)
-    cleaned = re.sub(r"(?i)投稿[:：]?\s*@?[A-Za-z0-9_]{4,}", "", cleaned)
-    cleaned = re.sub(r"(?i)爆料[:：]?\s*@?[A-Za-z0-9_]{4,}", "", cleaned)
-
-    return clean_blank_lines(cleaned)
+    return clean_blank_lines("\n".join(kept))
 
 
 def build_final_text(cleaned_text: str, post: Dict) -> str:
     final_text = cleaned_text.strip()
 
+    final_text = replace_all_contacts(final_text)
+
     if ENABLE_CONTACT_REPLACE and CONTACT_TEXT:
-        final_text = f"{final_text}\n\n{CONTACT_TEXT}"
+        contact_clean = CONTACT_TEXT.strip()
+
+        if contact_clean and contact_clean not in final_text:
+            final_text = f"{final_text}\n\n{contact_clean}"
 
     if APPEND_SOURCE_LINK:
         final_text = f"{final_text}\n\n来源：{post['link']}"
@@ -483,7 +580,8 @@ def looks_like_ad(raw_text: str, cleaned_text: str) -> bool:
         return True
 
     handle_count = len(CONTACT_HANDLE_RE.findall(raw_text))
-    if handle_count >= 3 and news_hits_cleaned == 0:
+
+    if handle_count >= 4 and news_hits_cleaned == 0:
         return True
 
     strong_ad_patterns = [
@@ -499,6 +597,8 @@ def looks_like_ad(raw_text: str, cleaned_text: str) -> bool:
         r"代充",
         r"担保交易",
         r"商务合作",
+        r"广告合作",
+        r"推广合作",
     ]
 
     for pattern in strong_ad_patterns:
@@ -517,13 +617,13 @@ def is_news_message(cleaned_text: str) -> bool:
 
     news_hits = keyword_count(cleaned_text, NEWS_KEYWORDS)
 
-    if news_hits > 0:
-        return True
-
-    return False
+    return news_hits > 0
 
 
 def prepare_post_for_send(post: Dict) -> Optional[str]:
+    if SKIP_VIDEO_POSTS and post.get("has_video"):
+        return None
+
     raw_text = post.get("text") or ""
 
     if not raw_text.strip():
@@ -581,6 +681,7 @@ def send_admin_message(chat_id: int, text: str):
 
 def split_text(text: str, limit: int = 3900) -> List[str]:
     text = text.strip()
+
     if len(text) <= limit:
         return [text]
 
@@ -597,6 +698,7 @@ def split_text(text: str, limit: int = 3900) -> List[str]:
 
             for i in range(0, len(p), limit):
                 chunks.append(p[i:i + limit])
+
             continue
 
         if len(current) + len(p) + 2 <= limit:
@@ -628,12 +730,14 @@ def download_image(image_url: str) -> BytesIO:
     headers = {
         "User-Agent": "Mozilla/5.0"
     }
+
     resp = requests.get(image_url, headers=headers, timeout=60)
     resp.raise_for_status()
 
     bio = BytesIO(resp.content)
     bio.name = "photo.jpg"
     bio.seek(0)
+
     return bio
 
 
@@ -668,36 +772,69 @@ def send_photo(image_url: str, caption: Optional[str] = None):
     bot_api("sendPhoto", data, files=files)
 
 
+def send_media_group(image_urls: List[str], caption: Optional[str] = None):
+    """
+    多图作为一个图集发。
+    注意：sendMediaGroup 要求 2-10 个媒体。
+    """
+    image_urls = image_urls[:10]
+
+    if len(image_urls) < 2:
+        if image_urls:
+            send_photo(image_urls[0], caption=caption)
+        return
+
+    media = []
+
+    for index, image_url in enumerate(image_urls):
+        item = {
+            "type": "photo",
+            "media": image_url,
+        }
+
+        if index == 0 and caption:
+            item["caption"] = caption[:1024]
+
+        media.append(item)
+
+    bot_api("sendMediaGroup", {
+        "chat_id": TARGET_CHANNEL,
+        "media": json.dumps(media, ensure_ascii=False),
+    })
+
+
 def send_post(text: str, images: List[str]):
     images = images or []
 
-    if SEND_IMAGES and images:
-        images = images[:MAX_IMAGES_PER_POST]
+    if not SEND_IMAGES or not images:
+        send_text(text)
+        return
 
-        try:
+    images = images[:MAX_IMAGES_PER_POST]
+
+    try:
+        # 单图：图 + 文案
+        if len(images) == 1:
             if len(text) <= 1024:
                 send_photo(images[0], caption=text)
-
-                for extra_img in images[1:]:
-                    time.sleep(1.5)
-                    try:
-                        send_photo(extra_img)
-                    except Exception as e:
-                        logger.warning(f"额外图片发送失败，跳过：{e}")
             else:
-                for img in images:
-                    try:
-                        send_photo(img)
-                        time.sleep(1.5)
-                    except Exception as e:
-                        logger.warning(f"图片发送失败，跳过：{e}")
-
+                send_photo(images[0])
+                time.sleep(1.5)
                 send_text(text)
-
             return
 
-        except Exception as e:
-            logger.warning(f"图片消息发送失败，改为纯文字发送：{e}")
+        # 多图：图集发送，第一张带 caption
+        if len(images) >= 2:
+            if len(text) <= 1024:
+                send_media_group(images, caption=text)
+            else:
+                send_media_group(images, caption=None)
+                time.sleep(1.5)
+                send_text(text)
+            return
+
+    except Exception as e:
+        logger.warning(f"图片/图集发送失败，改为纯文字发送：{e}")
 
     send_text(text)
 
@@ -708,6 +845,11 @@ def send_post(text: str, images: List[str]):
 
 def process_post(post: Dict) -> bool:
     if db.was_seen(post["post_key"]):
+        return False
+
+    if SKIP_VIDEO_POSTS and post.get("has_video"):
+        db.save_post(post, "skipped_video")
+        logger.info(f"跳过视频消息：{post['post_key']}")
         return False
 
     raw_text = post.get("text") or ""
@@ -735,7 +877,9 @@ def process_post(post: Dict) -> bool:
         db.save_post(post, "skipped_empty_after_clean")
         return False
 
-    logger.info(f"准备发送：{post['post_key']} | 图片数：{len(post.get('images') or [])}")
+    logger.info(
+        f"准备发送：{post['post_key']} | 图片数：{len(post.get('images') or [])} | 视频：{post.get('has_video')}"
+    )
 
     try:
         send_post(final_text, post.get("images") or [])
@@ -771,6 +915,7 @@ def process_source(source_url: str, remaining_limit: int) -> int:
         if FIRST_RUN_SKIP_OLD:
             for post in posts:
                 db.save_post(post, "skipped_initial")
+
             db.set_source_initialized(source_name)
             logger.info(f"首次运行，已跳过旧消息：{source_name} | 数量：{len(posts)}")
             return 0
@@ -828,6 +973,7 @@ def test_fetch_history(count: int, reply_chat_id: int):
 
             for post in posts:
                 final_text = prepare_post_for_send(post)
+
                 if not final_text:
                     continue
 
@@ -841,7 +987,10 @@ def test_fetch_history(count: int, reply_chat_id: int):
             send_admin_message(reply_chat_id, f"源抓取失败：{source_url}\n错误：{e}")
 
     if not candidates:
-        send_admin_message(reply_chat_id, "没有筛选到可发送的新闻。可能是关键词太严，或者源页面没有新内容。")
+        send_admin_message(
+            reply_chat_id,
+            "没有筛选到可发送的新闻。可能是关键词太严、全是视频、全是广告，或者源页面没有可用内容。"
+        )
         return
 
     candidates = candidates[-count:]
@@ -916,11 +1065,13 @@ def is_admin_user(user_id: int) -> bool:
 
 def parse_command(text: str) -> str:
     text = text.strip()
+
     if not text.startswith("/"):
         return ""
 
     first = text.split()[0]
     first = first.split("@")[0]
+
     return first.lower()
 
 
@@ -969,9 +1120,11 @@ def handle_command_message(message: Dict):
             f"目标频道：{TARGET_CHANNEL}\n"
             f"源频道数量：{len(source_pages)}\n"
             f"发送图片：{SEND_IMAGES}\n"
+            f"跳过视频：{SKIP_VIDEO_POSTS}\n"
             f"过滤广告关键词数量：{len(AD_KEYWORDS)}\n"
             f"新闻关键词数量：{len(NEWS_KEYWORDS)}\n"
             f"联系方式替换：{ENABLE_CONTACT_REPLACE}\n"
+            f"CONTACT_HANDLE：{CONTACT_HANDLE or '未设置'}\n"
             f"测试最多发送：{TEST_FETCH_MAX_COUNT} 条"
         )
         return
@@ -1008,6 +1161,7 @@ def handle_commands_once():
             max_update_id = max(max_update_id, update_id + 1)
 
             message = update.get("message")
+
             if not message:
                 continue
 
@@ -1063,6 +1217,7 @@ def main():
     logger.info(f"数据库路径：{DB_PATH}")
     logger.info(f"首次运行跳过旧消息：{FIRST_RUN_SKIP_OLD}")
     logger.info(f"发送图片：{SEND_IMAGES}")
+    logger.info(f"跳过视频消息：{SKIP_VIDEO_POSTS}")
     logger.info(f"要求新闻关键词：{REQUIRE_NEWS_KEYWORDS}")
     logger.info(f"命令功能：{COMMANDS_ENABLED}")
     logger.info(f"管理员数量：{len(ADMIN_USER_IDS)}")
