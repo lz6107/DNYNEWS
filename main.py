@@ -2,7 +2,6 @@ import os
 import re
 import time
 import html
-import json
 import random
 import sqlite3
 import hashlib
@@ -27,7 +26,6 @@ except Exception:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
-
 SOURCE_PAGES_RAW = os.getenv("SOURCE_PAGES", "").strip()
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
@@ -49,8 +47,16 @@ MIN_TEXT_LENGTH = int(os.getenv("MIN_TEXT_LENGTH", "20"))
 APPEND_SOURCE_LINK = os.getenv("APPEND_SOURCE_LINK", "false").lower() == "true"
 
 DB_PATH = os.getenv("DB_PATH", "data/tg_web_scraper.db")
-
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+
+# 命令配置
+COMMANDS_ENABLED = os.getenv("COMMANDS_ENABLED", "true").lower() == "true"
+ADMIN_USER_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
+COMMAND_CHECK_INTERVAL = int(os.getenv("COMMAND_CHECK_INTERVAL", "5"))
+
+TEST_FETCH_DEFAULT_COUNT = int(os.getenv("TEST_FETCH_DEFAULT_COUNT", "3"))
+TEST_FETCH_MAX_COUNT = int(os.getenv("TEST_FETCH_MAX_COUNT", "10"))
+TEST_SEND_DELAY = int(os.getenv("TEST_SEND_DELAY", "3"))
 
 
 # =========================
@@ -88,6 +94,18 @@ def split_keywords(value: str, default: List[str]) -> List[str]:
 
 AD_KEYWORDS = split_keywords(os.getenv("AD_KEYWORDS", ""), DEFAULT_AD_KEYWORDS)
 NEWS_KEYWORDS = split_keywords(os.getenv("NEWS_KEYWORDS", ""), DEFAULT_NEWS_KEYWORDS)
+
+
+def parse_admin_ids(raw: str) -> set:
+    ids = set()
+    for item in re.split(r"[,，\s]+", raw):
+        item = item.strip()
+        if item.isdigit():
+            ids.add(int(item))
+    return ids
+
+
+ADMIN_USER_IDS = parse_admin_ids(ADMIN_USER_IDS_RAW)
 
 
 # =========================
@@ -505,8 +523,30 @@ def is_news_message(cleaned_text: str) -> bool:
     return False
 
 
+def prepare_post_for_send(post: Dict) -> Optional[str]:
+    raw_text = post.get("text") or ""
+
+    if not raw_text.strip():
+        return None
+
+    cleaned_text = remove_original_contacts(raw_text)
+
+    if looks_like_ad(raw_text, cleaned_text):
+        return None
+
+    if not is_news_message(cleaned_text):
+        return None
+
+    final_text = build_final_text(cleaned_text, post)
+
+    if not final_text.strip():
+        return None
+
+    return final_text
+
+
 # =========================
-# Telegram Bot 发送
+# Telegram Bot API
 # =========================
 
 def bot_api(method: str, data: Dict, files=None) -> Dict:
@@ -526,6 +566,17 @@ def bot_api(method: str, data: Dict, files=None) -> Dict:
         raise RuntimeError(f"Telegram API 错误：{payload}")
 
     return payload
+
+
+def send_admin_message(chat_id: int, text: str):
+    try:
+        bot_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": "true",
+        })
+    except Exception as e:
+        logger.warning(f"回复命令失败：{e}")
 
 
 def split_text(text: str, limit: int = 3900) -> List[str]:
@@ -652,7 +703,7 @@ def send_post(text: str, images: List[str]):
 
 
 # =========================
-# 主处理逻辑
+# 正常采集逻辑
 # =========================
 
 def process_post(post: Dict) -> bool:
@@ -735,7 +786,6 @@ def process_source(source_url: str, remaining_limit: int) -> int:
         if db.was_seen(post["post_key"]):
             continue
 
-        before_sent = sent_count
         sent = process_post(post)
 
         if sent:
@@ -744,12 +794,244 @@ def process_source(source_url: str, remaining_limit: int) -> int:
             delay = random.randint(SEND_DELAY_MIN, SEND_DELAY_MAX)
             logger.info(f"等待 {delay} 秒后继续")
             time.sleep(delay)
-
-        if sent_count == before_sent:
+        else:
             time.sleep(1)
 
     return sent_count
 
+
+# =========================
+# 测试命令：立即抓历史并发送
+# =========================
+
+def test_fetch_history(count: int, reply_chat_id: int):
+    source_pages = make_source_pages()
+
+    if not source_pages:
+        send_admin_message(reply_chat_id, "SOURCE_PAGES 没有配置，无法测试。")
+        return
+
+    count = max(1, min(count, TEST_FETCH_MAX_COUNT))
+
+    send_admin_message(
+        reply_chat_id,
+        f"开始测试抓取历史消息，准备从源频道里筛选最新 {count} 条新闻发送到：{TARGET_CHANNEL}"
+    )
+
+    candidates = []
+
+    for source_url in source_pages:
+        try:
+            page_html = fetch_page(source_url)
+            posts = parse_messages(source_url, page_html)
+            logger.info(f"测试抓取：{source_url} 解析到 {len(posts)} 条")
+
+            for post in posts:
+                final_text = prepare_post_for_send(post)
+                if not final_text:
+                    continue
+
+                candidates.append({
+                    "post": post,
+                    "final_text": final_text,
+                })
+
+        except Exception as e:
+            logger.error(f"测试抓取源失败：{source_url} | {e}")
+            send_admin_message(reply_chat_id, f"源抓取失败：{source_url}\n错误：{e}")
+
+    if not candidates:
+        send_admin_message(reply_chat_id, "没有筛选到可发送的新闻。可能是关键词太严，或者源页面没有新内容。")
+        return
+
+    candidates = candidates[-count:]
+
+    sent = 0
+    failed = 0
+
+    for item in candidates:
+        post = item["post"]
+        final_text = item["final_text"]
+
+        try:
+            send_post(final_text, post.get("images") or [])
+            db.save_post(post, "sent_test")
+            sent += 1
+            logger.info(f"测试发送成功：{post['post_key']}")
+            time.sleep(TEST_SEND_DELAY)
+
+        except Exception as e:
+            failed += 1
+            logger.error(f"测试发送失败：{post['post_key']} | {e}")
+
+    send_admin_message(
+        reply_chat_id,
+        f"测试完成。\n成功发送：{sent} 条\n失败：{failed} 条\n目标频道：{TARGET_CHANNEL}"
+    )
+
+
+# =========================
+# 命令处理
+# =========================
+
+def get_updates(offset: Optional[int] = None) -> Dict:
+    data = {
+        "timeout": 0,
+        "limit": 20,
+        "allowed_updates": '["message"]',
+    }
+
+    if offset is not None:
+        data["offset"] = offset
+
+    return bot_api("getUpdates", data)
+
+
+def init_command_offset():
+    if not COMMANDS_ENABLED:
+        return
+
+    if db.get_setting("command_offset"):
+        return
+
+    try:
+        payload = get_updates()
+        updates = payload.get("result", [])
+
+        if updates:
+            max_update_id = max(u.get("update_id", 0) for u in updates)
+            db.set_setting("command_offset", str(max_update_id + 1))
+            logger.info(f"已跳过旧命令 update，offset={max_update_id + 1}")
+        else:
+            db.set_setting("command_offset", "0")
+            logger.info("命令 offset 初始化完成，没有旧命令")
+
+    except Exception as e:
+        logger.warning(f"初始化命令 offset 失败：{e}")
+
+
+def is_admin_user(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
+
+def parse_command(text: str) -> str:
+    text = text.strip()
+    if not text.startswith("/"):
+        return ""
+
+    first = text.split()[0]
+    first = first.split("@")[0]
+    return first.lower()
+
+
+def handle_command_message(message: Dict):
+    chat = message.get("chat", {}) or {}
+    from_user = message.get("from", {}) or {}
+
+    chat_id = chat.get("id")
+    user_id = from_user.get("id")
+    text = message.get("text", "") or ""
+
+    if not chat_id or not user_id or not text:
+        return
+
+    cmd = parse_command(text)
+
+    if cmd == "/id":
+        send_admin_message(
+            chat_id,
+            f"你的 Telegram 数字ID是：{user_id}\n\n把它填到 Railway：\nADMIN_USER_IDS={user_id}"
+        )
+        return
+
+    if cmd in ["/start", "/help"]:
+        send_admin_message(
+            chat_id,
+            "可用命令：\n"
+            "/id - 获取你的数字ID\n"
+            "/testfetch 3 - 立即抓取历史新闻测试发送\n"
+            "/status - 查看基础配置状态"
+        )
+        return
+
+    if not is_admin_user(user_id):
+        send_admin_message(
+            chat_id,
+            "你还没有管理员权限。\n\n先发送 /id 获取数字ID，然后把它填到 Railway 的 ADMIN_USER_IDS 里。"
+        )
+        return
+
+    if cmd == "/status":
+        source_pages = make_source_pages()
+        send_admin_message(
+            chat_id,
+            "当前状态：\n"
+            f"目标频道：{TARGET_CHANNEL}\n"
+            f"源频道数量：{len(source_pages)}\n"
+            f"发送图片：{SEND_IMAGES}\n"
+            f"过滤广告关键词数量：{len(AD_KEYWORDS)}\n"
+            f"新闻关键词数量：{len(NEWS_KEYWORDS)}\n"
+            f"联系方式替换：{ENABLE_CONTACT_REPLACE}\n"
+            f"测试最多发送：{TEST_FETCH_MAX_COUNT} 条"
+        )
+        return
+
+    if cmd == "/testfetch":
+        parts = text.split()
+        count = TEST_FETCH_DEFAULT_COUNT
+
+        if len(parts) >= 2 and parts[1].isdigit():
+            count = int(parts[1])
+
+        test_fetch_history(count, chat_id)
+        return
+
+
+def handle_commands_once():
+    if not COMMANDS_ENABLED:
+        return
+
+    offset_raw = db.get_setting("command_offset")
+    offset = int(offset_raw) if offset_raw and offset_raw.isdigit() else 0
+
+    try:
+        payload = get_updates(offset=offset)
+        updates = payload.get("result", [])
+
+        if not updates:
+            return
+
+        max_update_id = offset
+
+        for update in updates:
+            update_id = update.get("update_id", 0)
+            max_update_id = max(max_update_id, update_id + 1)
+
+            message = update.get("message")
+            if not message:
+                continue
+
+            handle_command_message(message)
+
+        db.set_setting("command_offset", str(max_update_id))
+
+    except Exception as e:
+        logger.warning(f"处理命令失败：{e}")
+
+
+def sleep_with_commands(total_seconds: int):
+    elapsed = 0
+
+    while elapsed < total_seconds:
+        step = min(COMMAND_CHECK_INTERVAL, total_seconds - elapsed)
+        time.sleep(step)
+        elapsed += step
+        handle_commands_once()
+
+
+# =========================
+# 启动检查 / 主循环
+# =========================
 
 def check_required_config():
     errors = []
@@ -782,9 +1064,15 @@ def main():
     logger.info(f"首次运行跳过旧消息：{FIRST_RUN_SKIP_OLD}")
     logger.info(f"发送图片：{SEND_IMAGES}")
     logger.info(f"要求新闻关键词：{REQUIRE_NEWS_KEYWORDS}")
+    logger.info(f"命令功能：{COMMANDS_ENABLED}")
+    logger.info(f"管理员数量：{len(ADMIN_USER_IDS)}")
+
+    init_command_offset()
 
     while True:
         try:
+            handle_commands_once()
+
             sent_this_round = 0
 
             for source_url in source_pages:
@@ -796,8 +1084,10 @@ def main():
                 sent = process_source(source_url, remaining)
                 sent_this_round += sent
 
+                handle_commands_once()
+
             logger.info(f"本轮完成，发送 {sent_this_round} 条，等待 {CHECK_INTERVAL} 秒")
-            time.sleep(CHECK_INTERVAL)
+            sleep_with_commands(CHECK_INTERVAL)
 
         except KeyboardInterrupt:
             logger.info("手动停止")
@@ -805,7 +1095,7 @@ def main():
 
         except Exception as e:
             logger.error(f"主循环错误：{e}")
-            time.sleep(30)
+            sleep_with_commands(30)
 
 
 if __name__ == "__main__":
